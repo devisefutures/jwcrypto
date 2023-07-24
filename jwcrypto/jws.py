@@ -6,6 +6,9 @@ from jwcrypto.common import base64url_decode, base64url_encode
 from jwcrypto.common import json_decode, json_encode
 from jwcrypto.jwa import JWA
 from jwcrypto.jwk import JWK, JWKSet
+import pkcs11
+from pkcs11.constants import ObjectClass
+from pkcs11.mechanisms import Mechanism
 
 JWSHeaderRegistry = {
     'alg': JWSEHeaderParameter('Algorithm', False, True, None),
@@ -142,6 +145,47 @@ class JWSCore:
                 return payload
             else:
                 return payload.encode('utf-8')
+
+    def sign_hsm(self,key_label,user_pin,lib_path,slot_id):
+        """Generates a signature"""
+        sigin = b'.'.join([self.protected.encode('utf-8'),
+                           self.payload])
+        
+        lib = pkcs11.lib(lib_path)
+        token = lib.get_slots()[slot_id].get_token()
+
+        with token.open(user_pin=user_pin) as session:
+            
+            # Find the key in the HSM
+            #key_label = "brainppol2".encode("utf-8")
+            private_key = session.get_key(object_class=ObjectClass.PRIVATE_KEY,id=key_label.encode("utf-8"))
+            print("\n Session: ", session, "\n")
+            print("\n Private Key: ", private_key, "\n")
+
+            # Sign data using the private key
+            hash_func = self.alg
+            
+            if hash_func == "ES256":
+                mechanism = Mechanism.ECDSA_SHA256
+            elif hash_func == "ES384":
+                mechanism = Mechanism.ECDSA_SHA384
+            elif hash_func == "ES512":
+                mechanism = Mechanism.ECDSA_SHA512
+            else:
+                mechanism = Mechanism.ECDSA_SHA256
+
+            print("\nMechanism: ", mechanism)
+
+            signature = private_key.sign(sigin,mechanism=mechanism)
+
+        
+        print("\n Signature ECDSA: ", base64url_encode(signature), "\n")
+
+        #signature = self.engine.sign(self.key, sigin)
+
+        return {'protected': self.protected,
+                'payload': self.payload,
+                'signature': base64url_encode(signature)}
 
     def sign(self):
         """Generates a signature"""
@@ -538,6 +582,97 @@ class JWS:
             self.allowed_algs
         )
         sig = c.sign()
+
+        o = {
+            'signature': base64url_decode(sig['signature']),
+            'valid': True,
+        }
+        if protected:
+            o['protected'] = protected
+        if header:
+            o['header'] = h
+
+        if 'signatures' in self.objects:
+            self.objects['signatures'].append(o)
+        elif 'signature' in self.objects:
+            self.objects['signatures'] = []
+            n = {'signature': self.objects.pop('signature')}
+            if 'protected' in self.objects:
+                n['protected'] = self.objects.pop('protected')
+            if 'header' in self.objects:
+                n['header'] = self.objects.pop('header')
+            if 'valid' in self.objects:
+                n['valid'] = self.objects.pop('valid')
+            self.objects['signatures'].append(n)
+            self.objects['signatures'].append(o)
+        else:
+            self.objects.update(o)
+            self.objects['b64'] = b64
+
+    def add_signature_hsm(self, key_label,user_pin,lib_path,slot_id, alg=None, protected=None, header=None):
+        """Adds a new signature to the object.
+
+        :param key: A (:class:`jwcrypto.jwk.JWK`) key of appropriate for
+         the "alg" provided.
+        :param alg: An optional algorithm name. If already provided as an
+         element of the protected or unprotected header it can be safely
+         omitted.
+        :param protected: The Protected Header (optional)
+        :param header: The Unprotected Header (optional)
+
+        :raises InvalidJWSObject: if invalid headers are provided.
+        :raises ValueError: if the key is not a (:class:`jwcrypto.jwk.JWK`)
+        :raises ValueError: if the algorithm is missing or is not provided
+         by one of the headers.
+        :raises InvalidJWAAlgorithm: if the algorithm is not valid, is
+         unknown or otherwise not yet implemented.
+        """
+
+        b64 = True
+
+        if protected:
+            if isinstance(protected, dict):
+                protected = json_encode(protected)
+            # Make sure p is always a deep copy of the dict
+            p = json_decode(protected)
+        else:
+            p = dict()
+
+        # If b64 is present we must enforce criticality
+        if 'b64' in list(p.keys()):
+            crit = p.get('crit', [])
+            if 'b64' not in crit:
+                raise InvalidJWSObject('b64 header must always be critical')
+            b64 = p['b64']
+
+        if 'b64' in self.objects:
+            if b64 != self.objects['b64']:
+                raise InvalidJWSObject('Mixed b64 headers on signatures')
+
+        h = None
+        if header:
+            if isinstance(header, dict):
+                header = json_encode(header)
+            # Make sure h is always a deep copy of the dict
+            h = json_decode(header)
+
+        p = self._merge_check_headers(p, h)
+
+        if 'alg' in p:
+            if alg is None:
+                alg = p['alg']
+            elif alg != p['alg']:
+                raise ValueError('"alg" value mismatch, specified "alg" '
+                                 'does not match JOSE header value')
+
+        if alg is None:
+            raise ValueError('"alg" not specified')
+
+        c = JWSCore(
+            alg, None, protected, self.objects.get('payload'),
+            self.allowed_algs
+        )
+        sig = c.sign_hsm(key_label=key_label,user_pin=user_pin,lib_path=lib_path,slot_id=slot_id)
 
         o = {
             'signature': base64url_decode(sig['signature']),
